@@ -464,7 +464,7 @@ def cmd_init() -> int:
     settings = settings_path()
     if not settings.exists():
         print(f"{_yellow('!')} global hook not found at {_tildify(settings)}")
-        print(f"  re-run the installer to configure it:")
+        print("  re-run the installer to configure it:")
         print()
         print(f"    curl -sSL {INSTALL_URL} | bash")
         print()

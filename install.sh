@@ -11,7 +11,7 @@ REPO_API="https://api.github.com/repos/stefanoverna/claude-ignore"
 # lockstep with claude-ignore.py — a mismatch aborts the install. Set
 # CLAUDE_IGNORE_SKIP_SHA=1 to bypass (only useful when developing against a
 # fork — never recommended for end users).
-EXPECTED_SHA256="f36c886e5e73b3d6e7c6e76459db5ec66732735ff5bec34ad3a3c0063390f2fc"
+EXPECTED_SHA256="fa3eb91bfd0030172f30cac5d0aebcdcc02f22aa77b44029d4ebdbcadd2dafcb"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/claude-ignore"
 SHARE_DIR="$HOME/.local/share/claude-ignore"
