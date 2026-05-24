@@ -263,6 +263,56 @@ def run_hook() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Output styling — matches install.sh (TTY-aware colors, summary rows)
+# ---------------------------------------------------------------------------
+
+def _tty(stream=sys.stdout) -> bool:
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def _c(code: str, stream=sys.stdout) -> str:
+    return f"\033[{code}m" if _tty(stream) else ""
+
+
+def _bold(s: str, stream=sys.stdout) -> str:
+    return f"{_c('1', stream)}{s}{_c('0', stream)}"
+
+
+def _dim(s: str, stream=sys.stdout) -> str:
+    return f"{_c('2', stream)}{s}{_c('0', stream)}"
+
+
+def _green(s: str, stream=sys.stdout) -> str:
+    return f"{_c('32', stream)}{s}{_c('0', stream)}"
+
+
+def _yellow(s: str, stream=sys.stdout) -> str:
+    return f"{_c('33', stream)}{s}{_c('0', stream)}"
+
+
+def _red(s: str, stream=sys.stdout) -> str:
+    return f"{_c('31', stream)}{s}{_c('0', stream)}"
+
+
+def _tildify(path: Path) -> str:
+    """Replace $HOME prefix with ~ for friendlier display."""
+    home = str(Path.home())
+    s = str(path)
+    if s == home or s.startswith(home + os.sep):
+        return "~" + s[len(home):]
+    return s
+
+
+def _header(action: str, status: str, color="green") -> str:
+    paint = {"green": _green, "yellow": _yellow, "dim": _dim, "red": _red}[color]
+    return f"{_bold('claude-ignore')} {_bold(action)}  ·  {paint(status)}"
+
+
+def _row(label: str, value: str, status: str) -> str:
+    return f"  {label:<8} {value:<44} {_dim(status)}"
+
+
+# ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 
@@ -280,32 +330,42 @@ secrets/
 def cmd_init() -> int:
     cwd = Path.cwd()
     target = cwd / ".claudeignore"
-    if target.exists():
-        print(f".claudeignore already exists at {target}")
-    else:
+    created = not target.exists()
+    if created:
         target.write_text(DEFAULT_CLAUDEIGNORE, encoding="utf-8")
-        print(f"created {target}")
+        print(_header("init", "created"))
+        file_status = "created with starter patterns"
+    else:
+        print(_header("init", "unchanged", color="dim"))
+        file_status = "already exists"
+
+    print()
+    print(_row("file", _tildify(target), file_status))
+    print()
 
     settings = settings_path()
     if not settings.exists():
-        print(
-            f"\nNote: global hook not found at {settings}.\n"
-            f"Re-run the installer to configure it:\n"
-            f"  curl -sSL {INSTALL_URL} | bash"
-        )
+        print(f"{_yellow('!')} global hook not found at {_tildify(settings)}")
+        print(f"  re-run the installer to configure it:")
+        print()
+        print(f"    curl -sSL {INSTALL_URL} | bash")
+        print()
+    elif created:
+        print(f"{_bold('next:')} edit {_tildify(target)} to add patterns to block.")
+        print()
     return 0
 
 
 def cmd_upgrade() -> int:
-    print("upgrading claude-ignore...")
     try:
+        # install.sh prints its own styled summary — don't duplicate it.
         result = subprocess.run(
             ["bash", "-c", f"curl -fsSL {INSTALL_URL} | bash"],
             check=False,
         )
         return result.returncode
     except FileNotFoundError:
-        print("claude-ignore: bash or curl not found", file=sys.stderr)
+        print(f"{_red('✗', sys.stderr)} bash or curl not found", file=sys.stderr)
         return 1
 
 
@@ -314,7 +374,11 @@ def cmd_uninstall() -> int:
     bin_p = bin_path()
     version_p = version_file()
 
+    print(_header("uninstall", "done"))
+    print()
+
     # Remove hook entry from settings.json
+    hook_status = "not configured"
     if settings_p.exists():
         try:
             data = json.loads(settings_p.read_text(encoding="utf-8"))
@@ -345,40 +409,70 @@ def cmd_uninstall() -> int:
             settings_p.write_text(
                 json.dumps(data, indent=2) + "\n", encoding="utf-8"
             )
-            print(f"removed {removed} hook entry/entries from {settings_p}")
+            if removed == 0:
+                hook_status = "no entries to remove"
+            elif removed == 1:
+                hook_status = "1 entry removed"
+            else:
+                hook_status = f"{removed} entries removed"
+    print(_row("hook", _tildify(settings_p), hook_status))
 
     # Remove binary
     if bin_p.exists() or bin_p.is_symlink():
         bin_p.unlink()
-        print(f"removed {bin_p}")
+        bin_status = "removed"
+    else:
+        bin_status = "not found"
+    print(_row("script", _tildify(bin_p), bin_status))
+
     if version_p.exists():
         version_p.unlink()
-    print("uninstall complete")
+        ver_status = "removed"
+    else:
+        ver_status = "not found"
+    print(_row("version", _tildify(version_p), ver_status))
+    print()
     return 0
 
 
 def cmd_version() -> int:
     version_p = version_file()
     if version_p.exists():
+        # Keep this minimal — `claude-ignore --version` is script-friendly.
         print(version_p.read_text(encoding="utf-8").strip())
     else:
-        print("unknown (not installed via install.sh)")
+        print("unknown")
+        print(
+            f"  {_dim('not installed via install.sh — run', sys.stderr)}",
+            file=sys.stderr,
+        )
+        print(
+            f"  curl -sSL {INSTALL_URL} | bash",
+            file=sys.stderr,
+        )
     return 0
 
 
 def cmd_help() -> int:
-    print(
-        f"""claude-ignore — block Claude Code reads via .claudeignore
+    def cmd_row(name: str, desc: str) -> str:
+        # Pad in plain text, then color — keeps columns aligned in TTYs.
+        return f"  {_bold(f'{name:<10}')}  {desc}"
 
-Usage:
-  claude-ignore              (hook mode — reads JSON from stdin)
-  claude-ignore init         create a starter .claudeignore in the current dir
-  claude-ignore upgrade      reinstall from {REPO_URL}
-  claude-ignore uninstall    remove hook config and the installed script
-  claude-ignore --version    print the installed version
-  claude-ignore --help       show this message
-"""
-    )
+    print(f"{_bold('claude-ignore')} — block Claude Code reads via .claudeignore")
+    print()
+    print(_bold("USAGE"))
+    print(f"  claude-ignore              {_dim('hook mode (reads JSON from stdin)')}")
+    print(f"  claude-ignore {_bold('<command>')}")
+    print()
+    print(_bold("COMMANDS"))
+    print(cmd_row("init",      "create a starter .claudeignore in the current dir"))
+    print(cmd_row("upgrade",   "reinstall the latest version"))
+    print(cmd_row("uninstall", "remove hook config and the installed script"))
+    print(cmd_row("version",   "print the installed version"))
+    print(cmd_row("help",      "show this message"))
+    print()
+    print(f"  {_dim(REPO_URL)}")
+    print()
     return 0
 
 
@@ -401,7 +495,11 @@ def main() -> int:
         return cmd_version()
     if cmd in ("--help", "-h", "help"):
         return cmd_help()
-    print(f"claude-ignore: unknown command '{cmd}'", file=sys.stderr)
+    print(
+        f"{_red('✗', sys.stderr)} unknown command {_bold(cmd, sys.stderr)}",
+        file=sys.stderr,
+    )
+    print(file=sys.stderr)
     cmd_help()
     return 1
 
