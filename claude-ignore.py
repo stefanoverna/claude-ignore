@@ -283,7 +283,7 @@ def run_pre_hook(payload: dict) -> int:
 # by `:N:` (content), `:N` (count), `-N-` (context), or nothing (files
 # mode). Extract every plausible head-of-line at a `:N` or `-N` boundary,
 # plus the whole line; callers discard candidates that don't exist on disk
-# and the longest existing one wins.
+# and block if any remaining candidate matches a .claudeignore rule.
 _GREP_PATH_SEP = re.compile(r"[:-]\d+(?:[:-]|$)")
 
 
