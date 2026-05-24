@@ -304,14 +304,15 @@ class HookEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(rc, 2, f"expected block, stderr: {err}")
 
-    def test_invalid_utf8_in_claudeignore_does_not_crash(self):
-        # Corrupt the .claudeignore — hook should log and continue (exit 0
-        # rather than propagating the decode error).
+    def test_invalid_utf8_in_claudeignore_fails_closed(self):
+        # Corrupt the .claudeignore — hook must block (exit 2) rather than
+        # silently dropping that file's rules. A security tool can't safely
+        # treat unreadable rule files as "no rules".
         (self.root / ".claudeignore").write_bytes(b"*.log\n\xff\xfe\n")
         rc, _, err = self.run_hook(
             {"tool_input": {"file_path": str(self.root / "ok.txt")}}
         )
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 2)
         self.assertIn("cannot read", err)
 
     def test_walk_up_works_independent_of_cwd(self):
@@ -323,6 +324,154 @@ class HookEndToEndTests(unittest.TestCase):
                 cwd=Path(other_cwd),
             )
             self.assertEqual(rc, 2, f"expected block, stderr: {err}")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: PostToolUse hook for Grep
+# ---------------------------------------------------------------------------
+
+class PostHookTests(unittest.TestCase):
+    """PostToolUse hook filters Grep responses that reference ignored paths."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.root = Path(self.tmpdir).resolve()
+        (self.root / ".claudeignore").write_text(
+            ".env\nsecrets/\n*.pem\n"
+        )
+        (self.root / ".env").write_text("API_KEY=sk-123\n")
+        (self.root / "ok.py").write_text("x = 1\n")
+        (self.root / "other.py").write_text("y = 2\n")
+        (self.root / "key.pem").write_text("---PRIV---\n")
+        (self.root / "secrets").mkdir()
+        (self.root / "secrets" / "tok.txt").write_text("hush\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def run_post(self, response, *, tool_name="Grep", search_path=None, extra_input=None):
+        tool_input = {"path": str(search_path or self.root)}
+        if extra_input:
+            tool_input.update(extra_input)
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "tool_response": response,
+        }
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT)],
+            input=json.dumps(payload),
+            text=True, capture_output=True, cwd=str(self.root),
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def _assert_blocked(self, stdout, *, must_mention=None):
+        decision = json.loads(stdout)
+        self.assertEqual(decision.get("decision"), "block")
+        self.assertIn("claude-ignore", decision.get("reason", ""))
+        if must_mention:
+            self.assertIn(must_mention, decision["reason"])
+
+    def test_ignores_non_grep_tools(self):
+        # PostToolUse for Read shouldn't do anything — pre-hook already gates.
+        rc, stdout, _ = self.run_post("anything", tool_name="Read")
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout, "")
+
+    def test_blocks_content_mode_when_response_mentions_ignored_file(self):
+        response = ".env:1:API_KEY=sk-123\nok.py:1:x = 1\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self._assert_blocked(stdout, must_mention=".env")
+
+    def test_allows_when_response_only_references_safe_files(self):
+        response = "ok.py:1:x = 1\nother.py:1:y = 2\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout, "")
+
+    def test_blocks_match_inside_ignored_directory(self):
+        response = "secrets/tok.txt:1:hush\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self._assert_blocked(stdout, must_mention="secrets/tok.txt")
+
+    def test_blocks_files_with_matches_mode(self):
+        # files_with_matches mode: one path per line, no `:N:` suffix
+        response = ".env\nok.py\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self._assert_blocked(stdout, must_mention=".env")
+
+    def test_blocks_count_mode(self):
+        response = ".env:5\nok.py:2\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self._assert_blocked(stdout, must_mention=".env")
+
+    def test_blocks_context_mode_with_dash_separator(self):
+        # Context lines use `path-N-content`
+        response = "key.pem-1-PRIVATE\nok.py-2-x = 1\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self._assert_blocked(stdout, must_mention="key.pem")
+
+    def test_blocks_absolute_paths(self):
+        response = f"{self.root}/.env:1:secret\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self._assert_blocked(stdout, must_mention=".env")
+
+    def test_allows_when_no_claudeignore_in_scope(self):
+        (self.root / ".claudeignore").unlink()
+        response = ".env:1:foo\n"
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout, "")
+
+    def test_handles_dict_tool_response(self):
+        # Some hosts wrap the tool response as a dict — serialize and scan.
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Grep",
+            "tool_input": {"path": str(self.root)},
+            "tool_response": {"output": ".env:1:API=x\n", "mode": "content"},
+        }
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT)],
+            input=json.dumps(payload),
+            text=True, capture_output=True, cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 0)
+        self._assert_blocked(proc.stdout, must_mention=".env")
+
+    def test_falls_back_to_cwd_when_path_missing(self):
+        # No `path` in tool_input → use cwd (we run from self.root).
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "API"},
+            "tool_response": ".env:1:API_KEY=x\n",
+        }
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT)],
+            input=json.dumps(payload),
+            text=True, capture_output=True, cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 0)
+        self._assert_blocked(proc.stdout, must_mention=".env")
+
+    def test_allows_when_ignored_basename_appears_only_in_content(self):
+        # `.env` as substring of a match line shouldn't trip the filter when
+        # no real file path resolves to an ignored target. Here we grep a
+        # source file that mentions ".env" as a string literal — extractor
+        # would consider the first token before `:N:` which IS the source
+        # file (ok.py), not `.env`, so we should allow.
+        response = 'ok.py:1:loader.load(".env")\n'
+        rc, stdout, _ = self.run_post(response)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout, "")
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +593,41 @@ class SubcommandTests(unittest.TestCase):
             # Binary + VERSION gone
             self.assertFalse((tmp_p / "claude-ignore").exists())
             self.assertFalse((tmp_p / "VERSION").exists())
+
+    def test_uninstall_removes_post_tool_use_entry(self):
+        # Uninstall must clean BOTH PreToolUse and PostToolUse entries.
+        # Preserves unrelated hooks under either event.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            settings = {
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Read", "hooks": [
+                            {"type": "command", "command": "claude-ignore"},
+                        ]},
+                    ],
+                    "PostToolUse": [
+                        {"matcher": "Grep", "hooks": [
+                            {"type": "command", "command": "claude-ignore"},
+                            {"type": "command", "command": "other-hook"},
+                        ]},
+                    ],
+                },
+            }
+            (tmp_p / "settings.json").write_text(json.dumps(settings))
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "uninstall"],
+                capture_output=True, text=True,
+                env=self._env_with_overrides(tmp_p),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            new_settings = json.loads((tmp_p / "settings.json").read_text())
+            # PreToolUse: only had claude-ignore → whole event key gone
+            self.assertNotIn("PreToolUse", new_settings.get("hooks", {}))
+            # PostToolUse: claude-ignore removed, other-hook preserved
+            post = new_settings["hooks"]["PostToolUse"]
+            commands = [h["command"] for h in post[0]["hooks"]]
+            self.assertEqual(commands, ["other-hook"])
 
     def test_uninstall_clears_empty_hooks_section(self):
         with tempfile.TemporaryDirectory() as tmp:

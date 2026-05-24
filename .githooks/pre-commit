@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Keep install.sh's EXPECTED_SHA256 in lockstep with claude-ignore.py.
+#
+# If claude-ignore.py is staged, recompute its SHA256 (from the *staged*
+# blob, not the worktree), rewrite install.sh, and re-stage install.sh
+# so the same commit ships both. We always hash the staged content because
+# that's what the commit will actually contain — hashing the worktree
+# would let an unstaged edit silently desync the two files.
+
+set -euo pipefail
+
+# Only act when claude-ignore.py is part of this commit.
+if ! git diff --cached --name-only | grep -qx 'claude-ignore.py'; then
+  exit 0
+fi
+
+if ! git ls-files --error-unmatch install.sh >/dev/null 2>&1; then
+  echo "pre-commit: install.sh not tracked — refusing to update SHA" >&2
+  exit 1
+fi
+
+# Hash the staged blob so we match what's being committed.
+STAGED_SHA=$(git show ":claude-ignore.py" | shasum -a 256 | awk '{print $1}')
+
+# Read current value from install.sh
+CURRENT_SHA=$(sed -n 's/^EXPECTED_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' install.sh | head -1)
+
+if [ "$CURRENT_SHA" = "$STAGED_SHA" ]; then
+  exit 0
+fi
+
+# Rewrite the line in place. Use a portable sed invocation (BSD + GNU).
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+awk -v sha="$STAGED_SHA" '
+  /^EXPECTED_SHA256="[0-9a-f]{64}"$/ { print "EXPECTED_SHA256=\"" sha "\""; next }
+  { print }
+' install.sh > "$TMP"
+
+# Sanity: confirm the new file has the expected line exactly once.
+if [ "$(grep -c "^EXPECTED_SHA256=\"$STAGED_SHA\"$" "$TMP")" != "1" ]; then
+  echo "pre-commit: failed to rewrite EXPECTED_SHA256 in install.sh" >&2
+  exit 1
+fi
+
+mv "$TMP" install.sh
+git add install.sh
+
+echo "pre-commit: bumped EXPECTED_SHA256 in install.sh ($CURRENT_SHA → $STAGED_SHA)"

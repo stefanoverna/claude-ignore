@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# One-time setup for contributors. Wires git to the tracked hooks in
+# .githooks/ so the pre-commit hook (which keeps install.sh's
+# EXPECTED_SHA256 in sync with claude-ignore.py) runs automatically.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ ! -d .git ]; then
+  echo "scripts/setup: must be run from a git checkout" >&2
+  exit 1
+fi
+
+git config core.hooksPath .githooks
+echo "✓ core.hooksPath → .githooks"
+echo "  pre-commit will now keep install.sh's SHA in sync with claude-ignore.py."

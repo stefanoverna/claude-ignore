@@ -209,12 +209,57 @@ def find_claudeignore_files(start: Path) -> list[Path]:
     return files
 
 
+def _find_ignore_match(path: Path) -> tuple[Path, str] | None:
+    """Return (ignore_file, reason) for the first .claudeignore that blocks
+    `path`, or None. `reason` is `"matched <ignore_file>"` for a pattern
+    hit, or `"cannot read <ignore_file>: <err>"` if the file existed but
+    couldn't be parsed.
+
+    Corrupt/unreadable .claudeignore counts as a block (fail-closed): if an
+    attacker can corrupt one (e.g. via a compromised dep) we'd otherwise
+    grant a partial bypass for that file's rules.
+
+    Walks up from `path`'s parent (or `path` itself if it's a directory).
+    Each .claudeignore is evaluated independently and ANY match blocks —
+    additive-only across files, deliberately stricter than git.
+    """
+    is_dir = path.is_dir()
+    start = path if is_dir else path.parent
+    for ignore_file in find_claudeignore_files(start):
+        base = ignore_file.parent
+        try:
+            rel = path.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        if not rel or rel == ".":
+            continue
+
+        matcher = GitignoreMatcher()
+        try:
+            matcher.add(ignore_file.read_text(encoding="utf-8").splitlines())
+        except (OSError, UnicodeDecodeError) as e:
+            return ignore_file, f"cannot read {ignore_file}: {e}"
+
+        if matcher.matches(rel, is_dir=is_dir):
+            return ignore_file, f"matched {ignore_file}"
+    return None
+
+
 def run_hook() -> int:
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError:
         return 0
 
+    # Dispatch on hook_event_name. PreToolUse blocks reads/edits/etc.
+    # before they run; PostToolUse runs after Grep and re-checks the
+    # response so search results can't leak content from ignored files.
+    if payload.get("hook_event_name") == "PostToolUse":
+        return run_post_hook(payload)
+    return run_pre_hook(payload)
+
+
+def run_pre_hook(payload: dict) -> int:
     tool_input = payload.get("tool_input") or {}
     target = tool_input.get("file_path") or tool_input.get("path") or ""
     if not target:
@@ -225,40 +270,113 @@ def run_hook() -> int:
         resolved = target_path.resolve()
     except OSError:
         return 0
-    is_dir = target_path.is_dir()
 
-    # Walk up from the target file's parent (not cwd) — this mirrors git's
-    # gitignore lookup and lets .claudeignore files affect reads regardless
-    # of where Claude was launched from.
-    #
-    # NOTE: each .claudeignore is evaluated independently and ANY match
-    # blocks the read. This is intentionally stricter than git: a leaf
-    # `!pattern` cannot re-include a file ignored by a root .claudeignore.
-    # For a security-oriented tool, additive-only semantics are safer.
-    start = resolved if is_dir else resolved.parent
-    for ignore_file in find_claudeignore_files(start):
-        base = ignore_file.parent
+    match = _find_ignore_match(resolved)
+    if match:
+        _, reason = match
+        print(f"claude-ignore: blocked read of {target} ({reason})", file=sys.stderr)
+        return 2
+    return 0
+
+
+# Ripgrep formats output with the path at the start of each line, followed
+# by `:N:` (content), `:N` (count), `-N-` (context), or nothing (files
+# mode). Extract every plausible head-of-line at a `:N` or `-N` boundary,
+# plus the whole line; callers discard candidates that don't exist on disk
+# and the longest existing one wins.
+_GREP_PATH_SEP = re.compile(r"[:-]\d+(?:[:-]|$)")
+
+
+def _stringify_response(tool_response) -> str:
+    """Flatten a tool_response into a newline-separated string suitable for
+    line-based path extraction. Some hosts wrap Grep output in a dict
+    (e.g. `{"output": "...", "mode": "content"}`); naively `json.dumps`ing
+    that escapes newlines and breaks per-line parsing — instead, walk the
+    structure and concatenate string values with real newlines."""
+    if isinstance(tool_response, str):
+        return tool_response
+    if isinstance(tool_response, dict):
+        return "\n".join(_stringify_response(v) for v in tool_response.values())
+    if isinstance(tool_response, list):
+        return "\n".join(_stringify_response(v) for v in tool_response)
+    return str(tool_response)
+
+
+def _extract_path_candidates(text: str) -> set[str]:
+    candidates: set[str] = set()
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        for m in _GREP_PATH_SEP.finditer(line):
+            head = line[: m.start()]
+            if head:
+                candidates.add(head)
+        candidates.add(line)
+    return candidates
+
+
+def run_post_hook(payload: dict) -> int:
+    """Filter Grep responses that reference .claudeignore-protected paths.
+
+    Grep's PreToolUse only sees the search root, not the files ripgrep
+    actually matched — so secrets can leak via `content` lines. Re-check
+    the response here and, if any returned path is protected, replace the
+    result with a 'block' decision so Claude never sees the content.
+    """
+    if payload.get("tool_name") != "Grep":
+        return 0
+
+    tool_input = payload.get("tool_input") or {}
+    tool_response = payload.get("tool_response")
+    if tool_response is None:
+        return 0
+
+    response_text = _stringify_response(tool_response)
+    if not response_text:
+        return 0
+
+    search_path = tool_input.get("path")
+    if search_path:
         try:
-            rel = resolved.relative_to(base).as_posix()
-        except ValueError:
-            continue
-        if not rel or rel == ".":
-            continue
+            root = Path(search_path).resolve()
+        except OSError:
+            return 0
+        if not root.is_dir():
+            root = root.parent
+    else:
+        root = Path.cwd().resolve()
 
-        matcher = GitignoreMatcher()
+    blocked: list[Path] = []
+    seen: set[Path] = set()
+    for tok in _extract_path_candidates(response_text):
+        p = Path(tok)
+        if not p.is_absolute():
+            p = root / p
         try:
-            matcher.add(ignore_file.read_text(encoding="utf-8").splitlines())
-        except (OSError, UnicodeDecodeError) as e:
-            print(f"claude-ignore: cannot read {ignore_file}: {e}", file=sys.stderr)
+            resolved = p.resolve()
+        except OSError:
             continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            if not resolved.exists():
+                continue
+        except OSError:
+            continue
+        if _find_ignore_match(resolved):
+            blocked.append(resolved)
 
-        if matcher.matches(rel, is_dir=is_dir):
-            print(
-                f"claude-ignore: blocked read of {target} "
-                f"(matched {ignore_file})",
-                file=sys.stderr,
-            )
-            return 2
+    if blocked:
+        sample = ", ".join(str(p) for p in sorted(blocked)[:3])
+        more = f" (+{len(blocked) - 3} more)" if len(blocked) > 3 else ""
+        reason = (
+            f"claude-ignore: Grep response references files protected by "
+            f".claudeignore: {sample}{more}. Re-run with a narrower `path` "
+            f'or `glob` exclusion (e.g. "!.env") to avoid these files.'
+        )
+        print(json.dumps({"decision": "block", "reason": reason}))
     return 0
 
 
@@ -369,10 +487,17 @@ def cmd_upgrade() -> int:
         return 1
 
 
+def _is_our_hook(command: str, abs_bin: str) -> bool:
+    """A hook entry belongs to us if it's the legacy bare name or the
+    absolute path the installer now writes."""
+    return command == HOOK_COMMAND or command == abs_bin
+
+
 def cmd_uninstall() -> int:
     settings_p = settings_path()
     bin_p = bin_path()
     version_p = version_file()
+    abs_bin = str(bin_p)
 
     print(_header("uninstall", "done"))
     print()
@@ -387,21 +512,25 @@ def cmd_uninstall() -> int:
 
         if isinstance(data, dict):
             hooks = data.get("hooks", {})
-            pretool = hooks.get("PreToolUse", [])
-            new_pretool = []
             removed = 0
-            for entry in pretool:
-                inner = entry.get("hooks", []) if isinstance(entry, dict) else []
-                kept = [h for h in inner if h.get("command") != HOOK_COMMAND]
-                if len(kept) != len(inner):
-                    removed += len(inner) - len(kept)
-                if kept:
-                    entry["hooks"] = kept
-                    new_pretool.append(entry)
-            if new_pretool:
-                hooks["PreToolUse"] = new_pretool
-            else:
-                hooks.pop("PreToolUse", None)
+            for event in ("PreToolUse", "PostToolUse"):
+                entries = hooks.get(event, [])
+                new_entries = []
+                for entry in entries:
+                    inner = entry.get("hooks", []) if isinstance(entry, dict) else []
+                    kept = [
+                        h for h in inner
+                        if not _is_our_hook(h.get("command", ""), abs_bin)
+                    ]
+                    if len(kept) != len(inner):
+                        removed += len(inner) - len(kept)
+                    if kept:
+                        entry["hooks"] = kept
+                        new_entries.append(entry)
+                if new_entries:
+                    hooks[event] = new_entries
+                else:
+                    hooks.pop(event, None)
             if not hooks:
                 data.pop("hooks", None)
             else:
